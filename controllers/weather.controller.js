@@ -6,6 +6,7 @@ const {
   AirQuality,
   History,
 } = require("../model/weather.model");
+const { GoogleGenerativeAI } = require("@google/generative-ai");
 require("dotenv").config();
 
 // Constants
@@ -13,6 +14,24 @@ const API_KEY = process.env.WEATHERAPI_KEY;
 const CACHE_DURATION = 30 * 60 * 1000; // 30 minutes
 const DEFAULT_LANG = "vi";
 const GEOAPIFY_KEY = process.env.GEOAPIFY_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+
+// Add OpenWeatherMap API constants
+const OPENWEATHER_API_KEY =
+  process.env.OPENWEATHER_API_KEY || "f147385a13b582f46c1de3374c8cdaec"; // Default key for testing
+const OPENWEATHER_BASE = "https://api.openweathermap.org/data/2.5";
+
+// Initialize Gemini
+const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+const model = genAI.getGenerativeModel({
+  model: "gemini-2.0-flash",
+  generationConfig: {
+    temperature: 0.7,
+    topK: 40,
+    topP: 0.95,
+    maxOutputTokens: 1024,
+  },
+});
 
 if (!API_KEY) {
   throw new Error("WEATHERAPI_KEY is not defined in environment variables");
@@ -686,6 +705,309 @@ const getAstronomy = async (req, res) => {
   }
 };
 
+/**
+ * Lấy dự báo thời tiết 7 ngày
+ */
+const getSevenDayForecast = async (req, res) => {
+  try {
+    const { location, lat, lon } = req.query;
+
+    // Kiểm tra API key
+    if (!OPENWEATHER_API_KEY) {
+      throw new Error("OpenWeatherMap API key is not configured");
+    }
+
+    // Kiểm tra nếu không có location thì phải có lat và lon
+    if (!location && (!lat || !lon)) {
+      throw new Error("Location or coordinates (lat,lon) is required");
+    }
+
+    // Xác định query parameter
+    const queryParam = lat && lon ? `${lat},${lon}` : location;
+
+    // Lấy thông tin địa điểm nếu chỉ có tên
+    let locationData = null;
+    if (!lat || !lon) {
+      locationData = await searchLocation(location);
+      if (!locationData || locationData.length === 0) {
+        throw new Error("Location not found");
+      }
+    }
+
+    // Kiểm tra trong database
+    const dbQuery = {
+      type: "seven_day_forecast",
+      ...(lat && lon
+        ? { latitude: lat, longitude: lon }
+        : { city: locationData ? locationData[0].name : location }),
+    };
+
+    const existingData = await findInDatabase(
+      Weather,
+      dbQuery,
+      CACHE_DURATIONS.forecast
+    );
+
+    if (existingData) {
+      console.log("Retrieved 7-day forecast from database");
+      return res.json({
+        message: "7-day forecast retrieved from database",
+        data: existingData.data,
+      });
+    }
+
+    // Nếu không có trong database, gọi OpenWeatherMap API
+    console.log("Fetching 5-day forecast from OpenWeatherMap API");
+    try {
+      const response = await axios.get(`${OPENWEATHER_BASE}/forecast`, {
+        params: {
+          ...(lat && lon
+            ? { lat, lon }
+            : { q: locationData ? locationData[0].name : location }),
+          appid: OPENWEATHER_API_KEY,
+          units: "metric",
+          lang: "vi",
+        },
+      });
+
+      if (!response.data || !response.data.list) {
+        throw new Error("Invalid response from OpenWeatherMap API");
+      }
+
+      // Xử lý dữ liệu từ OpenWeatherMap
+      const processedData = {
+        location: {
+          name: response.data.city.name,
+          country: response.data.city.country,
+          coord: response.data.city.coord,
+        },
+        forecast: [],
+      };
+
+      // Nhóm dữ liệu theo ngày
+      const dailyData = {};
+      response.data.list.forEach((item) => {
+        const date = item.dt_txt.split(" ")[0];
+        if (!dailyData[date]) {
+          dailyData[date] = {
+            temps: [],
+            feels_like: [],
+            humidity: [],
+            weather: item.weather,
+            wind_speeds: [],
+            wind_deg: [],
+            pop: [],
+          };
+        }
+        dailyData[date].temps.push(item.main.temp);
+        dailyData[date].feels_like.push(item.main.feels_like);
+        dailyData[date].humidity.push(item.main.humidity);
+        dailyData[date].wind_speeds.push(item.wind.speed);
+        dailyData[date].wind_deg.push(item.wind.deg);
+        dailyData[date].pop.push(item.pop);
+      });
+
+      // Tính trung bình cho mỗi ngày
+      Object.entries(dailyData).forEach(([date, data]) => {
+        processedData.forecast.push({
+          dt: new Date(date).getTime() / 1000,
+          dt_txt: date,
+          main: {
+            temp: data.temps.reduce((a, b) => a + b) / data.temps.length,
+            feels_like:
+              data.feels_like.reduce((a, b) => a + b) / data.feels_like.length,
+            temp_min: Math.min(...data.temps),
+            temp_max: Math.max(...data.temps),
+            humidity: Math.round(
+              data.humidity.reduce((a, b) => a + b) / data.humidity.length
+            ),
+          },
+          weather: data.weather,
+          wind: {
+            speed:
+              data.wind_speeds.reduce((a, b) => a + b) /
+              data.wind_speeds.length,
+            deg: Math.round(
+              data.wind_deg.reduce((a, b) => a + b) / data.wind_deg.length
+            ),
+          },
+          pop: Math.max(...data.pop),
+          clouds: { all: 0 },
+          visibility: 10000,
+        });
+      });
+
+      // Xác định tên thành phố
+      const cityName =
+        response.data.city.name ||
+        (locationData ? locationData[0].name : location) ||
+        `${lat},${lon}`;
+
+      // Tạo prompt cho Gemini để dự đoán thêm 2 ngày
+      const prompt = `Dựa trên dữ liệu thời tiết 5 ngày qua của ${cityName}, hãy dự đoán thời tiết cho 2 ngày tiếp theo (ngày 6 và 7). 
+      Dữ liệu 5 ngày qua:
+      ${JSON.stringify(processedData.forecast, null, 2)}
+      
+      Hãy trả về JSON với format chính xác như sau (không thêm bất kỳ text nào khác):
+      {
+        "day6": {
+          "date": "YYYY-MM-DD",
+          "main": {
+            "temp": 25.5,
+            "feels_like": 26.0,
+            "temp_min": 24.0,
+            "temp_max": 27.0,
+            "humidity": 75
+          },
+          "weather": [
+            {
+              "main": "Clouds",
+              "description": "mây rải rác"
+            }
+          ],
+          "wind": {
+            "speed": 3.5,
+            "deg": 180
+          },
+          "pop": 0.2
+        },
+        "day7": {
+          "date": "YYYY-MM-DD",
+          "main": {
+            "temp": 26.0,
+            "feels_like": 26.5,
+            "temp_min": 25.0,
+            "temp_max": 28.0,
+            "humidity": 80
+          },
+          "weather": [
+            {
+              "main": "Rain",
+              "description": "mưa nhẹ"
+            }
+          ],
+          "wind": {
+            "speed": 4.0,
+            "deg": 190
+          },
+          "pop": 0.4
+        }
+      }
+
+      Lưu ý:
+      1. Chỉ cần dự đoán theo ngày, không cần theo mốc 3 giờ
+      2. Các giá trị số phải là số thực, không phải chuỗi
+      3. Các giá trị chuỗi phải được đặt trong dấu ngoặc kép
+      4. Không thêm bất kỳ text nào khác ngoài JSON
+      5. Dựa trên xu hướng thời tiết 5 ngày qua để dự đoán`;
+
+      // Gọi Gemini API để dự đoán
+      const geminiResponse = await model.generateContent(prompt);
+      const geminiText = geminiResponse.response.text();
+      console.log("Raw Gemini response:", geminiText);
+
+      // Tìm JSON trong response
+      const jsonMatch = geminiText.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) {
+        console.error("No JSON found in Gemini response");
+        throw new Error("No valid JSON found in AI prediction response");
+      }
+
+      try {
+        // Thử parse JSON
+        const jsonStr = jsonMatch[0];
+        console.log("Extracted JSON string:", jsonStr);
+
+        const predictedData = JSON.parse(jsonStr);
+        console.log("Parsed prediction data:", predictedData);
+
+        // Validate dữ liệu
+        if (!predictedData.day6 || !predictedData.day7) {
+          throw new Error("Invalid prediction data structure");
+        }
+
+        // Thêm dự đoán ngày 6
+        processedData.forecast.push({
+          dt: new Date(predictedData.day6.date).getTime() / 1000,
+          dt_txt: predictedData.day6.date,
+          main: {
+            temp: Number(predictedData.day6.main.temp),
+            feels_like: Number(predictedData.day6.main.feels_like),
+            temp_min: Number(predictedData.day6.main.temp_min),
+            temp_max: Number(predictedData.day6.main.temp_max),
+            humidity: Number(predictedData.day6.main.humidity),
+          },
+          weather: predictedData.day6.weather,
+          wind: {
+            speed: Number(predictedData.day6.wind.speed),
+            deg: Number(predictedData.day6.wind.deg),
+          },
+          pop: Number(predictedData.day6.pop),
+          clouds: { all: 0 },
+          visibility: 10000,
+        });
+
+        // Thêm dự đoán ngày 7
+        processedData.forecast.push({
+          dt: new Date(predictedData.day7.date).getTime() / 1000,
+          dt_txt: predictedData.day7.date,
+          main: {
+            temp: Number(predictedData.day7.main.temp),
+            feels_like: Number(predictedData.day7.main.feels_like),
+            temp_min: Number(predictedData.day7.main.temp_min),
+            temp_max: Number(predictedData.day7.main.temp_max),
+            humidity: Number(predictedData.day7.main.humidity),
+          },
+          weather: predictedData.day7.weather,
+          wind: {
+            speed: Number(predictedData.day7.wind.speed),
+            deg: Number(predictedData.day7.wind.deg),
+          },
+          pop: Number(predictedData.day7.pop),
+          clouds: { all: 0 },
+          visibility: 10000,
+        });
+
+        // Thêm thông báo về dự đoán
+        processedData.notice =
+          "Dự báo 7 ngày bao gồm: 5 ngày từ OpenWeatherMap API và 2 ngày được dự đoán bởi AI.";
+      } catch (parseError) {
+        console.error("Error parsing Gemini response:", parseError);
+        console.error("Raw response:", geminiText);
+        throw new Error(
+          "Invalid response format from AI prediction: " + parseError.message
+        );
+      }
+
+      // Lưu vào database
+      await saveToDatabase(Weather, {
+        type: "seven_day_forecast",
+        source: "openweathermap+gemini",
+        time: new Date(),
+        longitude: lon || (locationData ? locationData[0].lon : null),
+        latitude: lat || (locationData ? locationData[0].lat : null),
+        city: cityName,
+        location: location || `${lat},${lon}`,
+        data: processedData,
+      });
+
+      return res.json({
+        message:
+          "7-day forecast retrieved from OpenWeatherMap API and Gemini AI",
+        data: processedData,
+      });
+    } catch (apiError) {
+      console.error("API Error:", apiError.response?.data || apiError.message);
+      if (apiError.response?.data?.message) {
+        throw new Error(apiError.response.data.message);
+      }
+      throw new Error("Failed to fetch weather data");
+    }
+  } catch (error) {
+    return handleError(res, error, "7-Day Forecast");
+  }
+};
+
 const searchLocation = async (query) => {
   try {
     const response = await axios.get(
@@ -726,4 +1048,5 @@ module.exports = {
   getAstronomy,
   getTimeZone,
   getWeatherAlerts,
+  getSevenDayForecast,
 };

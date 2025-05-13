@@ -8,6 +8,7 @@ const {
   getAstronomy,
   getTimeZone,
   getWeatherAlerts,
+  getSevenDayForecast,
 } = require("../controllers/weather.controller");
 const {
   handleChat,
@@ -76,6 +77,7 @@ const validateQuery = (req, res, next) => {
 // Weather routes
 router.get("/weather/current", validateQuery, getCurrentWeather);
 router.get("/weather/forecast", validateQuery, getForecast);
+router.get("/weather/forecast/7days", validateQuery, getSevenDayForecast);
 router.get("/weather/future", validateQuery, getFutureWeather);
 router.get("/weather/marine", validateQuery, getMarineWeather);
 router.get("/weather/astronomy", validateQuery, getAstronomy);
