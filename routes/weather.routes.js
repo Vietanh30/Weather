@@ -25,13 +25,51 @@ const errorHandler = (err, req, res, next) => {
 
 // Input validation middleware
 const validateQuery = (req, res, next) => {
-  const { location } = req.query;
-  if (!location) {
+  const { location, lat, lon } = req.query;
+
+  // Kiểm tra nếu có lat thì phải có lon và ngược lại
+  if ((lat && !lon) || (!lat && lon)) {
     return res.status(400).json({
-      error: "Location is required",
-      message: "Vui lòng cung cấp địa điểm.",
+      error: "Invalid coordinates",
+      message: "Cần cung cấp cả latitude và longitude.",
     });
   }
+
+  // Nếu không có location name thì phải có lat,lon
+  if (!location && (!lat || !lon)) {
+    return res.status(400).json({
+      error: "Location is required",
+      message: "Vui lòng cung cấp địa điểm (tên) hoặc tọa độ (lat,lon).",
+    });
+  }
+
+  // Validate lat,lon nếu có
+  if (lat && lon) {
+    const latNum = parseFloat(lat);
+    const lonNum = parseFloat(lon);
+
+    if (isNaN(latNum) || isNaN(lonNum)) {
+      return res.status(400).json({
+        error: "Invalid coordinates",
+        message: "Latitude và longitude phải là số.",
+      });
+    }
+
+    if (latNum < -90 || latNum > 90) {
+      return res.status(400).json({
+        error: "Invalid latitude",
+        message: "Latitude phải nằm trong khoảng -90 đến 90.",
+      });
+    }
+
+    if (lonNum < -180 || lonNum > 180) {
+      return res.status(400).json({
+        error: "Invalid longitude",
+        message: "Longitude phải nằm trong khoảng -180 đến 180.",
+      });
+    }
+  }
+
   next();
 };
 

@@ -153,33 +153,96 @@ const handleError = (res, error, type) => {
   });
 };
 
+// Helper functions for database operations
+const findInDatabase = async (Model, query, timeWindow) => {
+  const timeAgo = new Date();
+  timeAgo.setHours(timeAgo.getHours() - timeWindow);
+  return await Model.findOne({
+    ...query,
+    time: { $gte: timeAgo },
+  }).sort({ time: -1 });
+};
+
+const saveToDatabase = async (Model, data) => {
+  return await Model.create(data);
+};
+
+// Cache durations in hours
+const CACHE_DURATIONS = {
+  current: 1, // 1 hour
+  forecast: 3, // 3 hours
+  future: 24, // 24 hours
+  marine: 6, // 6 hours
+  astronomy: 24, // 24 hours
+  timezone: 24, // 24 hours
+  alerts: 1, // 1 hour
+};
+
 /**
  * Lấy thông tin thời tiết hiện tại
  */
 const getCurrentWeather = async (req, res) => {
   try {
-    const { location } = req.query;
+    const { location, lat, lon } = req.query;
     validateLocation(location);
 
-    // Check cache
-    const cacheKey = `current_${location}`;
-    const cachedData = getCachedData(cacheKey);
-    if (cachedData) {
+    // Xác định query parameter
+    const queryParam = lat && lon ? `${lat},${lon}` : location;
+
+    // Lấy thông tin địa điểm nếu chỉ có tên
+    let locationData = null;
+    if (!lat || !lon) {
+      locationData = await searchLocation(location);
+      if (!locationData || locationData.length === 0) {
+        throw new Error("Location not found");
+      }
+    }
+
+    // Kiểm tra trong database
+    const dbQuery = {
+      type: "current",
+      ...(lat && lon
+        ? { latitude: lat, longitude: lon }
+        : { city: locationData ? locationData[0].name : location }),
+    };
+
+    const existingData = await findInDatabase(
+      Weather,
+      dbQuery,
+      CACHE_DURATIONS.current
+    );
+
+    if (existingData) {
+      console.log("Retrieved current weather from database");
       return res.json({
-        message: "Current weather retrieved from cache",
-        data: cachedData,
+        message: "Current weather retrieved from database",
+        data: existingData.data,
       });
     }
 
+    // Nếu không có trong database, gọi API
+    console.log("Fetching current weather from API");
     const data = await callWeatherAPI(API_ENDPOINTS.current, {
-      q: location,
+      q: queryParam,
       aqi: "yes",
     });
 
-    // Set cache
-    setCachedData(cacheKey, data);
+    // Lưu vào database
+    await saveToDatabase(Weather, {
+      type: "current",
+      source: "weatherapi",
+      time: new Date(),
+      longitude: lon || (locationData ? locationData[0].lon : null),
+      latitude: lat || (locationData ? locationData[0].lat : null),
+      city: locationData ? locationData[0].name : location,
+      location: location || `${lat},${lon}`,
+      data: data,
+    });
 
-    return handleResponse(res, data, "current", location);
+    return res.json({
+      message: "Current weather retrieved from API and saved to database",
+      data,
+    });
   } catch (error) {
     return handleError(res, error, "Current Weather");
   }
@@ -190,30 +253,70 @@ const getCurrentWeather = async (req, res) => {
  */
 const getForecast = async (req, res) => {
   try {
-    const { location, days = 3 } = req.query;
+    const { location, days = 3, lat, lon } = req.query;
     validateLocation(location);
     validateDays(days);
 
-    // Check cache
-    const cacheKey = `forecast_${location}_${days}`;
-    const cachedData = getCachedData(cacheKey);
-    if (cachedData) {
+    // Xác định query parameter
+    const queryParam = lat && lon ? `${lat},${lon}` : location;
+
+    // Lấy thông tin địa điểm nếu chỉ có tên
+    let locationData = null;
+    if (!lat || !lon) {
+      locationData = await searchLocation(location);
+      if (!locationData || locationData.length === 0) {
+        throw new Error("Location not found");
+      }
+    }
+
+    // Kiểm tra trong database
+    const dbQuery = {
+      type: "forecast",
+      days: days,
+      ...(lat && lon
+        ? { latitude: lat, longitude: lon }
+        : { city: locationData ? locationData[0].name : location }),
+    };
+
+    const existingData = await findInDatabase(
+      Weather,
+      dbQuery,
+      CACHE_DURATIONS.forecast
+    );
+
+    if (existingData) {
+      console.log("Retrieved forecast from database");
       return res.json({
-        message: "Forecast retrieved from cache",
-        data: cachedData,
+        message: "Forecast retrieved from database",
+        data: existingData.data,
       });
     }
 
+    // Nếu không có trong database, gọi API
+    console.log("Fetching forecast from API");
     const data = await callWeatherAPI(API_ENDPOINTS.forecast, {
-      q: location,
+      q: queryParam,
       days,
       aqi: "yes",
     });
 
-    // Set cache
-    setCachedData(cacheKey, data);
+    // Lưu vào database
+    await saveToDatabase(Weather, {
+      type: "forecast",
+      source: "weatherapi",
+      time: new Date(),
+      longitude: lon || (locationData ? locationData[0].lon : null),
+      latitude: lat || (locationData ? locationData[0].lat : null),
+      city: locationData ? locationData[0].name : location,
+      location: location || `${lat},${lon}`,
+      days: days,
+      data: data,
+    });
 
-    return handleResponse(res, data, "forecast", location);
+    return res.json({
+      message: "Forecast retrieved from API and saved to database",
+      data,
+    });
   } catch (error) {
     return handleError(res, error, "Forecast");
   }
@@ -224,49 +327,68 @@ const getForecast = async (req, res) => {
  */
 const getFutureWeather = async (req, res) => {
   try {
-    const { location, date } = req.query;
+    const { location, date, lat, lon } = req.query;
     validateLocation(location);
     validateDate(date);
 
-    // Check cache
-    const cacheKey = `future_${location}_${date}`;
-    const cachedData = getCachedData(cacheKey);
-    if (cachedData) {
+    // Xác định query parameter
+    const queryParam = lat && lon ? `${lat},${lon}` : location;
+
+    // Lấy thông tin địa điểm nếu chỉ có tên
+    let locationData = null;
+    if (!lat || !lon) {
+      locationData = await searchLocation(location);
+      if (!locationData || locationData.length === 0) {
+        throw new Error("Location not found");
+      }
+    }
+
+    // Kiểm tra trong database
+    const dbQuery = {
+      type: "future",
+      date: date,
+      ...(lat && lon
+        ? { latitude: lat, longitude: lon }
+        : { city: locationData ? locationData[0].name : location }),
+    };
+
+    const existingData = await findInDatabase(
+      Weather,
+      dbQuery,
+      CACHE_DURATIONS.future
+    );
+
+    if (existingData) {
+      console.log("Retrieved future weather from database");
       return res.json({
-        message: "Future weather retrieved from cache",
-        data: cachedData,
+        message: "Future weather retrieved from database",
+        data: existingData.data,
       });
     }
 
-    // Lấy thông tin địa điểm
-    const locationData = await searchLocation(location);
-    if (!locationData || locationData.length === 0) {
-      throw new Error("Location not found");
-    }
-
+    // Nếu không có trong database, gọi API
+    console.log("Fetching future weather from API");
     const data = await callWeatherAPI(API_ENDPOINTS.future, {
-      q: location,
+      q: queryParam,
       dt: date,
       aqi: "yes",
     });
 
-    // Set cache
-    setCachedData(cacheKey, data);
-
-    // Lưu vào database với đầy đủ thông tin
-    await Weather.create({
+    // Lưu vào database
+    await saveToDatabase(Weather, {
       type: "future",
       source: "weatherapi",
       time: new Date(),
-      longitude: locationData[0].lon,
-      latitude: locationData[0].lat,
-      city: locationData[0].name,
-      location: location,
+      longitude: lon || (locationData ? locationData[0].lon : null),
+      latitude: lat || (locationData ? locationData[0].lat : null),
+      city: locationData ? locationData[0].name : location,
+      location: location || `${lat},${lon}`,
+      date: date,
       data: data,
     });
 
     return res.json({
-      message: "Future weather retrieved successfully",
+      message: "Future weather retrieved from API and saved to database",
       data,
     });
   } catch (error) {
@@ -279,77 +401,67 @@ const getFutureWeather = async (req, res) => {
  */
 const getMarineWeather = async (req, res) => {
   try {
-    const { location } = req.query;
+    const { location, lat, lon } = req.query;
     validateLocation(location);
 
-    // Check cache
-    const cacheKey = `marine_${location}`;
-    const cachedData = getCachedData(cacheKey);
-    if (cachedData) {
+    // Xác định query parameter
+    const queryParam = lat && lon ? `${lat},${lon}` : location;
+
+    // Lấy thông tin địa điểm nếu chỉ có tên
+    let locationData = null;
+    if (!lat || !lon) {
+      locationData = await searchLocation(location);
+      if (!locationData || locationData.length === 0) {
+        throw new Error("Location not found");
+      }
+    }
+
+    // Kiểm tra trong database
+    const dbQuery = {
+      type: "marine",
+      ...(lat && lon
+        ? { latitude: lat, longitude: lon }
+        : { city: locationData ? locationData[0].name : location }),
+    };
+
+    const existingData = await findInDatabase(
+      Marine,
+      dbQuery,
+      CACHE_DURATIONS.marine
+    );
+
+    if (existingData) {
+      console.log("Retrieved marine weather from database");
       return res.json({
-        message: "Marine weather retrieved from cache",
-        data: cachedData,
+        message: "Marine weather retrieved from database",
+        data: existingData.data,
       });
     }
 
+    // Nếu không có trong database, gọi API
+    console.log("Fetching marine weather from API");
     const data = await callWeatherAPI(API_ENDPOINTS.marine, {
-      q: location,
+      q: queryParam,
       tides: "yes",
     });
 
-    // Set cache
-    setCachedData(cacheKey, data);
-
-    return handleResponse(res, data, "marine", location);
-  } catch (error) {
-    return handleError(res, error, "Marine Weather");
-  }
-};
-
-/**
- * Lấy thông tin thiên văn
- */
-const getAstronomy = async (req, res) => {
-  try {
-    const { location, date } = req.query;
-    validateLocation(location);
-    if (date) {
-      validateDate(date);
-    }
-
-    const targetDate = date || new Date().toISOString().split("T")[0];
-
-    // Check cache
-    const cacheKey = `astronomy_${location}_${targetDate}`;
-    const cachedData = getCachedData(cacheKey);
-    if (cachedData) {
-      return res.json({
-        message: "Astronomy data retrieved from cache",
-        data: cachedData,
-      });
-    }
-
-    const data = await callWeatherAPI(API_ENDPOINTS.astronomy, {
-      q: location,
-      dt: targetDate,
-    });
-
-    // Set cache
-    setCachedData(cacheKey, data);
-
-    // Save to database
-    await Astronomy.create({
-      location,
-      date: targetDate,
-      data,
+    // Lưu vào database
+    await saveToDatabase(Marine, {
+      source: "weatherapi",
+      time: new Date(),
+      longitude: lon || (locationData ? locationData[0].lon : null),
+      latitude: lat || (locationData ? locationData[0].lat : null),
+      city: locationData ? locationData[0].name : location,
+      location: location || `${lat},${lon}`,
+      data: data,
     });
 
     return res.json({
-      message: "Astronomy data retrieved successfully",
+      message: "Marine weather retrieved from API and saved to database",
       data,
     });
   } catch (error) {
-    return handleError(res, error, "Astronomy");
+    return handleError(res, error, "Marine Weather");
   }
 };
 
@@ -358,28 +470,63 @@ const getAstronomy = async (req, res) => {
  */
 const getTimeZone = async (req, res) => {
   try {
-    const { location } = req.query;
+    const { location, lat, lon } = req.query;
     validateLocation(location);
 
-    // Check cache
-    const cacheKey = `timezone_${location}`;
-    const cachedData = getCachedData(cacheKey);
-    if (cachedData) {
+    // Xác định query parameter
+    const queryParam = lat && lon ? `${lat},${lon}` : location;
+
+    // Lấy thông tin địa điểm nếu chỉ có tên
+    let locationData = null;
+    if (!lat || !lon) {
+      locationData = await searchLocation(location);
+      if (!locationData || locationData.length === 0) {
+        throw new Error("Location not found");
+      }
+    }
+
+    // Kiểm tra trong database
+    const dbQuery = {
+      type: "timezone",
+      ...(lat && lon
+        ? { latitude: lat, longitude: lon }
+        : { city: locationData ? locationData[0].name : location }),
+    };
+
+    const existingData = await findInDatabase(
+      Weather,
+      dbQuery,
+      CACHE_DURATIONS.timezone
+    );
+
+    if (existingData) {
+      console.log("Retrieved timezone from database");
       return res.json({
-        message: "Time zone data retrieved from cache",
-        data: cachedData,
+        message: "Time zone data retrieved from database",
+        data: existingData.data,
       });
     }
 
+    // Nếu không có trong database, gọi API
+    console.log("Fetching timezone from API");
     const data = await callWeatherAPI(API_ENDPOINTS.timezone, {
-      q: location,
+      q: queryParam,
     });
 
-    // Set cache
-    setCachedData(cacheKey, data);
+    // Lưu vào database
+    await saveToDatabase(Weather, {
+      type: "timezone",
+      source: "weatherapi",
+      time: new Date(),
+      longitude: lon || (locationData ? locationData[0].lon : null),
+      latitude: lat || (locationData ? locationData[0].lat : null),
+      city: locationData ? locationData[0].name : location,
+      location: location || `${lat},${lon}`,
+      data: data,
+    });
 
     return res.json({
-      message: "Time zone data retrieved successfully",
+      message: "Time zone data retrieved from API and saved to database",
       data,
     });
   } catch (error) {
@@ -392,32 +539,150 @@ const getTimeZone = async (req, res) => {
  */
 const getWeatherAlerts = async (req, res) => {
   try {
-    const { location } = req.query;
+    const { location, lat, lon } = req.query;
     validateLocation(location);
 
-    // Check cache
-    const cacheKey = `alerts_${location}`;
-    const cachedData = getCachedData(cacheKey);
-    if (cachedData) {
+    // Xác định query parameter
+    const queryParam = lat && lon ? `${lat},${lon}` : location;
+
+    // Lấy thông tin địa điểm nếu chỉ có tên
+    let locationData = null;
+    if (!lat || !lon) {
+      locationData = await searchLocation(location);
+      if (!locationData || locationData.length === 0) {
+        throw new Error("Location not found");
+      }
+    }
+
+    // Kiểm tra trong database
+    const dbQuery = {
+      type: "alerts",
+      ...(lat && lon
+        ? { latitude: lat, longitude: lon }
+        : { city: locationData ? locationData[0].name : location }),
+    };
+
+    const existingData = await findInDatabase(
+      Weather,
+      dbQuery,
+      CACHE_DURATIONS.alerts
+    );
+
+    if (existingData) {
+      console.log("Retrieved weather alerts from database");
       return res.json({
-        message: "Weather alerts retrieved from cache",
-        data: cachedData,
+        message: "Weather alerts retrieved from database",
+        data: existingData.data,
       });
     }
 
+    // Nếu không có trong database, gọi API
+    console.log("Fetching weather alerts from API");
     const data = await callWeatherAPI(API_ENDPOINTS.alerts, {
-      q: location,
+      q: queryParam,
     });
 
-    // Set cache
-    setCachedData(cacheKey, data);
+    // Lưu vào database
+    await saveToDatabase(Weather, {
+      type: "alerts",
+      source: "weatherapi",
+      time: new Date(),
+      longitude: lon || (locationData ? locationData[0].lon : null),
+      latitude: lat || (locationData ? locationData[0].lat : null),
+      city: locationData ? locationData[0].name : location,
+      location: location || `${lat},${lon}`,
+      data: data,
+    });
 
     return res.json({
-      message: "Weather alerts retrieved successfully",
+      message: "Weather alerts retrieved from API and saved to database",
       data,
     });
   } catch (error) {
     return handleError(res, error, "Weather Alerts");
+  }
+};
+
+/**
+ * Lấy thông tin thiên văn
+ */
+const getAstronomy = async (req, res) => {
+  try {
+    const { location, date, lat, lon } = req.query;
+    validateLocation(location);
+    if (date) {
+      validateDate(date);
+    }
+
+    const targetDate = date || new Date().toISOString().split("T")[0];
+
+    // Xác định query parameter
+    const queryParam = lat && lon ? `${lat},${lon}` : location;
+
+    // Lấy thông tin địa điểm nếu chỉ có tên
+    let locationData = null;
+    if (!lat || !lon) {
+      locationData = await searchLocation(location);
+      if (!locationData || locationData.length === 0) {
+        throw new Error("Location not found");
+      }
+    }
+
+    // Kiểm tra trong database
+    const dbQuery = {
+      date: targetDate,
+      ...(lat && lon
+        ? { latitude: lat, longitude: lon }
+        : { city: locationData ? locationData[0].name : location }),
+    };
+
+    const existingData = await findInDatabase(
+      Astronomy,
+      dbQuery,
+      CACHE_DURATIONS.astronomy
+    );
+
+    if (existingData) {
+      console.log("Retrieved astronomy data from database");
+      return res.json({
+        message: "Astronomy data retrieved from database",
+        data: existingData.data,
+      });
+    }
+
+    // Nếu không có trong database, gọi API
+    console.log("Fetching astronomy data from API");
+    const data = await callWeatherAPI(API_ENDPOINTS.astronomy, {
+      q: queryParam,
+      dt: targetDate,
+    });
+
+    // Lưu vào database
+    await saveToDatabase(Astronomy, {
+      source: "weatherapi",
+      time: new Date(),
+      longitude: lon || (locationData ? locationData[0].lon : null),
+      latitude: lat || (locationData ? locationData[0].lat : null),
+      city: locationData ? locationData[0].name : location,
+      location: location || `${lat},${lon}`,
+      date: targetDate,
+      sunrise: data.astronomy.astro.sunrise,
+      sunset: data.astronomy.astro.sunset,
+      moonrise: data.astronomy.astro.moonrise,
+      moonset: data.astronomy.astro.moonset,
+      moon_phase: data.astronomy.astro.moon_phase,
+      moon_illumination: data.astronomy.astro.moon_illumination,
+      is_sun_up: data.astronomy.astro.is_sun_up,
+      is_moon_up: data.astronomy.astro.is_moon_up,
+      data: data,
+    });
+
+    return res.json({
+      message: "Astronomy data retrieved from API and saved to database",
+      data,
+    });
+  } catch (error) {
+    return handleError(res, error, "Astronomy");
   }
 };
 

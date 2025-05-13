@@ -813,28 +813,25 @@ const processWeatherQuestion = async (question, city) => {
     let marineData = null;
     let timezoneData = null;
     let alertsData = null;
-    let sportsData = null;
 
     // Lấy thông tin thời tiết hiện tại
     try {
-      const currentResponse = await axios.get(API_ENDPOINTS.current, {
+      const response = await axios.get(API_ENDPOINTS.current, {
         params: {
           key: API_KEY,
           q: location ? `${location.lat},${location.lon}` : city,
           lang: "vi",
           aqi: "yes",
         },
-        retry: 3,
-        retryDelay: 1000,
       });
-      currentData = currentResponse.data;
+      currentData = response.data;
     } catch (error) {
       console.error("Error fetching current weather:", error.message);
     }
 
     // Lấy thông tin dự báo
     try {
-      const forecastResponse = await axios.get(API_ENDPOINTS.forecast, {
+      const response = await axios.get(API_ENDPOINTS.forecast, {
         params: {
           key: API_KEY,
           q: location ? `${location.lat},${location.lon}` : city,
@@ -843,27 +840,23 @@ const processWeatherQuestion = async (question, city) => {
           hour:
             analysis.time.type === "hourly" ? analysis.time.value : undefined,
         },
-        retry: 3,
-        retryDelay: 1000,
       });
-      forecastData = forecastResponse.data;
+      forecastData = response.data;
     } catch (error) {
       console.error("Error fetching forecast:", error.message);
     }
 
     // Lấy thông tin thiên văn
     try {
-      const astronomyResponse = await axios.get(API_ENDPOINTS.astronomy, {
+      const response = await axios.get(API_ENDPOINTS.astronomy, {
         params: {
           key: API_KEY,
           q: location ? `${location.lat},${location.lon}` : city,
           dt: targetDate.toISOString().split("T")[0],
           lang: "vi",
         },
-        retry: 3,
-        retryDelay: 1000,
       });
-      astronomyData = astronomyResponse.data;
+      astronomyData = response.data;
     } catch (error) {
       console.error("Error fetching astronomy data:", error.message);
     }
@@ -872,10 +865,15 @@ const processWeatherQuestion = async (question, city) => {
     const daysDiff = Math.ceil((targetDate - today) / (1000 * 60 * 60 * 24));
     if (daysDiff > 14 && daysDiff <= 300) {
       try {
-        futureData = await getFutureWeather(
-          location ? `${location.lat},${location.lon}` : city,
-          targetDate.toISOString().split("T")[0]
-        );
+        const response = await axios.get(API_ENDPOINTS.future, {
+          params: {
+            key: API_KEY,
+            q: location ? `${location.lat},${location.lon}` : city,
+            dt: targetDate.toISOString().split("T")[0],
+            lang: "vi",
+          },
+        });
+        futureData = response.data;
       } catch (error) {
         console.error("Error fetching future weather:", error.message);
       }
@@ -883,38 +881,44 @@ const processWeatherQuestion = async (question, city) => {
 
     // Lấy thông tin thời tiết biển nếu là vùng ven biển
     try {
-      marineData = await getMarineWeather(
-        location ? `${location.lat},${location.lon}` : city
-      );
+      const response = await axios.get(API_ENDPOINTS.marine, {
+        params: {
+          key: API_KEY,
+          q: location ? `${location.lat},${location.lon}` : city,
+          tides: "yes",
+          lang: "vi",
+        },
+      });
+      marineData = response.data;
     } catch (error) {
       console.error("Error fetching marine weather:", error.message);
     }
 
     // Lấy thông tin múi giờ
     try {
-      timezoneData = await getTimeZone(
-        location ? `${location.lat},${location.lon}` : city
-      );
+      const response = await axios.get(API_ENDPOINTS.timezone, {
+        params: {
+          key: API_KEY,
+          q: location ? `${location.lat},${location.lon}` : city,
+        },
+      });
+      timezoneData = response.data;
     } catch (error) {
       console.error("Error fetching timezone:", error.message);
     }
 
     // Lấy thông tin cảnh báo thời tiết
     try {
-      alertsData = await getWeatherAlerts(
-        location ? `${location.lat},${location.lon}` : city
-      );
+      const response = await axios.get(API_ENDPOINTS.alerts, {
+        params: {
+          key: API_KEY,
+          q: location ? `${location.lat},${location.lon}` : city,
+          lang: "vi",
+        },
+      });
+      alertsData = response.data;
     } catch (error) {
       console.error("Error fetching weather alerts:", error.message);
-    }
-
-    // Lấy thông tin sự kiện thể thao
-    try {
-      sportsData = await getSportsEvents(
-        location ? `${location.lat},${location.lon}` : city
-      );
-    } catch (error) {
-      console.error("Error fetching sports events:", error.message);
     }
 
     // Kiểm tra xem có đủ dữ liệu để trả lời không
@@ -936,7 +940,6 @@ const processWeatherQuestion = async (question, city) => {
       marine: marineData || null,
       timezone: timezoneData || null,
       alerts: alertsData || null,
-      sports: sportsData || null,
       analysis: analysis,
       targetDate: targetDate.toISOString().split("T")[0],
     };
