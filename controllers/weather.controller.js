@@ -90,12 +90,34 @@ const setCachedData = (key, data) => {
 };
 
 // Validation functions
-const validateLocation = (location) => {
-  if (!location) {
-    throw new Error("Location is required");
+const validateLocation = (location, lat, lon) => {
+  // Nếu có location thì không cần kiểm tra lat,lon
+  if (location) {
+    if (typeof location !== "string") {
+      throw new Error("Location must be a string");
+    }
+    return;
   }
-  if (typeof location !== "string") {
-    throw new Error("Location must be a string");
+
+  // Nếu không có location thì phải có cả lat và lon
+  if (!lat || !lon) {
+    throw new Error("Location or coordinates (lat,lon) is required");
+  }
+
+  // Validate lat,lon nếu có
+  const latNum = parseFloat(lat);
+  const lonNum = parseFloat(lon);
+
+  if (isNaN(latNum) || isNaN(lonNum)) {
+    throw new Error("Latitude and longitude must be numbers");
+  }
+
+  if (latNum < -90 || latNum > 90) {
+    throw new Error("Latitude must be between -90 and 90");
+  }
+
+  if (lonNum < -180 || lonNum > 180) {
+    throw new Error("Longitude must be between -180 and 180");
   }
 };
 
@@ -195,6 +217,7 @@ const CACHE_DURATIONS = {
   astronomy: 24, // 24 hours
   timezone: 24, // 24 hours
   alerts: 1, // 1 hour
+  history: 24, // 24 hours
 };
 
 /**
@@ -203,7 +226,7 @@ const CACHE_DURATIONS = {
 const getCurrentWeather = async (req, res) => {
   try {
     const { location, lat, lon } = req.query;
-    validateLocation(location);
+    validateLocation(location, lat, lon);
 
     // Xác định query parameter
     const queryParam = lat && lon ? `${lat},${lon}` : location;
@@ -253,7 +276,7 @@ const getCurrentWeather = async (req, res) => {
       time: new Date(),
       longitude: lon || (locationData ? locationData[0].lon : null),
       latitude: lat || (locationData ? locationData[0].lat : null),
-      city: locationData ? locationData[0].name : location,
+      city: locationData ? locationData[0].name : location || `${lat},${lon}`,
       location: location || `${lat},${lon}`,
       data: data,
     });
@@ -273,7 +296,7 @@ const getCurrentWeather = async (req, res) => {
 const getForecast = async (req, res) => {
   try {
     const { location, days = 3, lat, lon } = req.query;
-    validateLocation(location);
+    validateLocation(location, lat, lon);
     validateDays(days);
 
     // Xác định query parameter
@@ -347,7 +370,7 @@ const getForecast = async (req, res) => {
 const getFutureWeather = async (req, res) => {
   try {
     const { location, date, lat, lon } = req.query;
-    validateLocation(location);
+    validateLocation(location, lat, lon);
     validateDate(date);
 
     // Xác định query parameter
@@ -421,7 +444,7 @@ const getFutureWeather = async (req, res) => {
 const getMarineWeather = async (req, res) => {
   try {
     const { location, lat, lon } = req.query;
-    validateLocation(location);
+    validateLocation(location, lat, lon);
 
     // Xác định query parameter
     const queryParam = lat && lon ? `${lat},${lon}` : location;
@@ -490,7 +513,7 @@ const getMarineWeather = async (req, res) => {
 const getTimeZone = async (req, res) => {
   try {
     const { location, lat, lon } = req.query;
-    validateLocation(location);
+    validateLocation(location, lat, lon);
 
     // Xác định query parameter
     const queryParam = lat && lon ? `${lat},${lon}` : location;
@@ -559,7 +582,7 @@ const getTimeZone = async (req, res) => {
 const getWeatherAlerts = async (req, res) => {
   try {
     const { location, lat, lon } = req.query;
-    validateLocation(location);
+    validateLocation(location, lat, lon);
 
     // Xác định query parameter
     const queryParam = lat && lon ? `${lat},${lon}` : location;
@@ -628,7 +651,7 @@ const getWeatherAlerts = async (req, res) => {
 const getAstronomy = async (req, res) => {
   try {
     const { location, date, lat, lon } = req.query;
-    validateLocation(location);
+    validateLocation(location, lat, lon);
     if (date) {
       validateDate(date);
     }
@@ -1008,6 +1031,122 @@ const getSevenDayForecast = async (req, res) => {
   }
 };
 
+/**
+ * Lấy thông tin thời tiết trong quá khứ
+ */
+const getWeatherHistory = async (req, res) => {
+  try {
+    console.log("Weather History Request Query:", req.query);
+    const { q, dt, location, date, lat, lon } = req.query;
+
+    // Sử dụng q nếu có, nếu không thì dùng location
+    const finalLocation = q || location;
+    // Sử dụng dt nếu có, nếu không thì dùng date
+    const finalDate = dt || date;
+
+    // Validate location and date
+    try {
+      validateLocation(finalLocation, lat, lon);
+      validateDate(finalDate);
+    } catch (validationError) {
+      console.error("Validation Error:", validationError);
+      throw validationError;
+    }
+
+    // Xác định query parameter
+    const queryParam = lat && lon ? `${lat},${lon}` : finalLocation;
+    console.log("Query Parameter:", queryParam);
+
+    // Lấy thông tin địa điểm nếu chỉ có tên
+    let locationData = null;
+    if (!lat || !lon) {
+      try {
+        locationData = await searchLocation(finalLocation);
+        console.log("Location Search Result:", locationData);
+        if (!locationData || locationData.length === 0) {
+          throw new Error("Location not found");
+        }
+      } catch (searchError) {
+        console.error("Location Search Error:", searchError);
+        throw searchError;
+      }
+    }
+
+    // Kiểm tra trong database
+    const dbQuery = {
+      type: "history",
+      date: finalDate,
+      ...(lat && lon
+        ? { latitude: lat, longitude: lon }
+        : { city: locationData ? locationData[0].name : finalLocation }),
+    };
+    console.log("Database Query:", dbQuery);
+
+    try {
+      const existingData = await findInDatabase(
+        History,
+        dbQuery,
+        CACHE_DURATIONS.history
+      );
+
+      if (existingData) {
+        console.log("Retrieved weather history from database");
+        return res.json({
+          message: "Weather history retrieved from database",
+          data: existingData.data,
+        });
+      }
+    } catch (dbError) {
+      console.error("Database Error:", dbError);
+      // Continue to API call if database fails
+    }
+
+    // Nếu không có trong database, gọi API
+    console.log("Fetching weather history from API");
+    try {
+      const data = await callWeatherAPI(API_ENDPOINTS.history, {
+        q: queryParam,
+        dt: finalDate,
+        lang: "vi",
+        aqi: "yes",
+      });
+      console.log("API Response:", data);
+
+      // Lưu vào database
+      try {
+        await saveToDatabase(History, {
+          type: "history",
+          source: "weatherapi",
+          time: new Date(),
+          longitude: lon || (locationData ? locationData[0].lon : null),
+          latitude: lat || (locationData ? locationData[0].lat : null),
+          city: locationData ? locationData[0].name : finalLocation,
+          location: finalLocation || `${lat},${lon}`,
+          date: finalDate,
+          data: data,
+        });
+      } catch (saveError) {
+        console.error("Database Save Error:", saveError);
+        // Continue even if save fails
+      }
+
+      return res.json({
+        message: "Weather history retrieved from API and saved to database",
+        data,
+      });
+    } catch (apiError) {
+      console.error("API Error:", apiError);
+      if (apiError.response) {
+        console.error("API Error Response:", apiError.response.data);
+      }
+      throw apiError;
+    }
+  } catch (error) {
+    console.error("Weather History Error:", error);
+    return handleError(res, error, "Weather History");
+  }
+};
+
 const searchLocation = async (query) => {
   try {
     const response = await axios.get(
@@ -1049,4 +1188,5 @@ module.exports = {
   getTimeZone,
   getWeatherAlerts,
   getSevenDayForecast,
+  getWeatherHistory,
 };

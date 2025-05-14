@@ -63,17 +63,60 @@ const setCachedData = (key, data) => {
   });
 };
 
-// Initialize Gemini
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({
-  model: "gemini-2.0-flash",
-  generationConfig: {
-    temperature: 0.7,
-    topK: 40,
-    topP: 0.95,
-    maxOutputTokens: 1024,
-  },
-});
+// Initialize Gemini with retry logic
+const initGemini = () => {
+  try {
+    const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+    return genAI.getGenerativeModel({
+      model: "gemini-2.0-flash",
+      generationConfig: {
+        temperature: 0.7,
+        topK: 40,
+        topP: 0.95,
+        maxOutputTokens: 1024,
+      },
+    });
+  } catch (error) {
+    console.error("Error initializing Gemini:", error);
+    return null;
+  }
+};
+
+const model = initGemini();
+
+// Add retry logic for Gemini API calls
+const generateWithRetry = async (prompt, maxRetries = 3) => {
+  let lastError = null;
+
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      if (!model) {
+        throw new Error("Gemini model not initialized");
+      }
+
+      const result = await model.generateContent(prompt);
+      return result.response.text();
+    } catch (error) {
+      console.error(`Gemini API attempt ${i + 1} failed:`, error);
+      lastError = error;
+
+      // Wait before retrying (exponential backoff)
+      await new Promise((resolve) =>
+        setTimeout(resolve, Math.pow(2, i) * 1000)
+      );
+
+      // Try to reinitialize model on error
+      if (i === maxRetries - 1) {
+        const newModel = initGemini();
+        if (newModel) {
+          model = newModel;
+        }
+      }
+    }
+  }
+
+  throw lastError;
+};
 
 // Common API call function
 const callWeatherAPI = async (endpoint, params) => {
@@ -138,7 +181,7 @@ const analyzeQuestion = async (question) => {
     const prompt = `Phân tích câu hỏi sau và trả về JSON với các thông tin:
     1. location: tên địa điểm (nếu có)
     2. time: thông tin thời gian (nếu có)
-    3. type: loại thông tin thời tiết cần lấy (current, hourly, daily, range)
+    3. type: loại thông tin thời tiết cần lấy (current, forecast, history, future, marine, astronomy, timezone, alerts)
     4. details: các chi tiết bổ sung (nhiệt độ, mưa, gió, etc.)
 
     Câu hỏi: "${question}"
@@ -147,11 +190,12 @@ const analyzeQuestion = async (question) => {
     {
       "location": "string hoặc null",
       "time": {
-        "type": "current/specific/range/hourly",
+        "type": "current/specific/range/hourly/history",
         "value": "giá trị cụ thể",
-        "period": "morning/afternoon/evening/night hoặc null"
+        "period": "morning/afternoon/evening/night hoặc null",
+        "isHistory": true/false
       },
-      "type": "current/hourly/daily/range",
+      "type": "current/forecast/history/future/marine/astronomy/timezone/alerts",
       "details": ["temperature", "rain", "wind", etc.]
     }`;
 
@@ -163,7 +207,35 @@ const analyzeQuestion = async (question) => {
       throw new Error("No JSON found in response");
     }
 
-    return JSON.parse(jsonMatch[0]);
+    const analysis = JSON.parse(jsonMatch[0]);
+
+    // Đảm bảo type là một trong các giá trị cho phép
+    const validTypes = [
+      "current",
+      "forecast",
+      "history",
+      "future",
+      "marine",
+      "astronomy",
+      "timezone",
+      "alerts",
+    ];
+
+    if (!validTypes.includes(analysis.type)) {
+      // Nếu type không hợp lệ, chuyển đổi dựa trên context
+      if (analysis.time?.isHistory) {
+        analysis.type = "history";
+      } else if (
+        analysis.time?.type === "range" ||
+        analysis.time?.type === "future"
+      ) {
+        analysis.type = "forecast";
+      } else {
+        analysis.type = "current";
+      }
+    }
+
+    return analysis;
   } catch (error) {
     console.error("Error analyzing question:", error);
     return manualAnalyzeQuestion(question);
@@ -179,68 +251,73 @@ const manualAnalyzeQuestion = (question) => {
       type: "current",
       value: null,
       period: null,
+      isHistory: false,
     },
     type: "current",
     details: [],
   };
 
-  // Time patterns
-  const timePatterns = [
-    { pattern: /(\d+)\s*giờ\s*sáng/i, period: "morning" },
-    { pattern: /(\d+)\s*giờ\s*trưa/i, period: "noon" },
-    { pattern: /(\d+)\s*giờ\s*chiều/i, period: "afternoon" },
-    { pattern: /(\d+)\s*giờ\s*tối/i, period: "evening" },
-    { pattern: /(\d+)\s*giờ\s*đêm/i, period: "night" },
-    { pattern: /(\d+)\s*h/i, period: "current" },
+  // Kiểm tra câu hỏi về lịch sử
+  const historyPatterns = [
+    /thời tiết\s+(\d+)\s+ngày\s+trước/i,
+    /thời tiết\s+hôm\s+qua/i,
+    /thời tiết\s+(\d+)\s+ngày\s+qua/i,
+    /thời tiết\s+ngày\s+(\d{1,2})\/(\d{1,2})\/(\d{4})/i,
   ];
 
-  for (const { pattern, period } of timePatterns) {
+  for (const pattern of historyPatterns) {
     const match = normalizedQuestion.match(pattern);
     if (match) {
-      analysis.time.type = "hourly";
-      analysis.time.value = parseInt(match[1]);
-      analysis.time.period = period;
-      analysis.type = "hourly";
-      break;
-    }
-  }
+      analysis.time.type = "history";
+      analysis.type = "history";
+      analysis.time.isHistory = true;
 
-  // Date patterns
-  const datePatterns = {
-    "hôm nay": { type: "specific", value: "today" },
-    "hôm qua": { type: "specific", value: "yesterday" },
-    "ngày mai": { type: "specific", value: "tomorrow" },
-    "ngày kia": { type: "specific", value: "day_after_tomorrow" },
-    "ngày mốt": { type: "specific", value: "day_after_tomorrow" },
-  };
-
-  for (const [pattern, info] of Object.entries(datePatterns)) {
-    if (normalizedQuestion.includes(pattern)) {
-      if (analysis.time.type !== "hourly") {
-        analysis.time.type = info.type;
-        analysis.time.value = info.value;
+      if (match[1]) {
+        const daysAgo = parseInt(match[1]);
+        const date = new Date();
+        date.setDate(date.getDate() - daysAgo);
+        analysis.time.value = date.toISOString().split("T")[0];
+      } else if (match[0].includes("hôm qua")) {
+        const date = new Date();
+        date.setDate(date.getDate() - 1);
+        analysis.time.value = date.toISOString().split("T")[0];
+      } else if (match[1] && match[2] && match[3]) {
+        analysis.time.value = `${match[3]}-${match[2].padStart(
+          2,
+          "0"
+        )}-${match[1].padStart(2, "0")}`;
       }
       break;
     }
   }
 
-  // Range patterns
-  const rangePatterns = [
-    { pattern: /(\d+)\s*ngày\s*tới/i, type: "future" },
-    { pattern: /(\d+)\s*ngày\s*sau/i, type: "future" },
-    { pattern: /(\d+)\s*ngày\s*qua/i, type: "past" },
-    { pattern: /(\d+)\s*ngày\s*trước/i, type: "past" },
-  ];
-
-  for (const { pattern, type } of rangePatterns) {
-    const match = normalizedQuestion.match(pattern);
-    if (match) {
-      analysis.time.type = "range";
-      analysis.time.value = parseInt(match[1]);
-      analysis.time.rangeType = type;
-      analysis.type = "range";
-      break;
-    }
+  // Kiểm tra các loại câu hỏi khác
+  if (
+    normalizedQuestion.includes("dự báo") ||
+    normalizedQuestion.includes("ngày mai") ||
+    normalizedQuestion.includes("tuần tới")
+  ) {
+    analysis.type = "forecast";
+  } else if (
+    normalizedQuestion.includes("biển") ||
+    normalizedQuestion.includes("sóng")
+  ) {
+    analysis.type = "marine";
+  } else if (
+    normalizedQuestion.includes("mặt trời") ||
+    normalizedQuestion.includes("mặt trăng")
+  ) {
+    analysis.type = "astronomy";
+  } else if (
+    normalizedQuestion.includes("cảnh báo") ||
+    normalizedQuestion.includes("bão")
+  ) {
+    analysis.type = "alerts";
+  } else if (
+    normalizedQuestion.includes("múi giờ") ||
+    normalizedQuestion.includes("giờ địa phương")
+  ) {
+    analysis.type = "timezone";
   }
 
   return analysis;
@@ -442,154 +519,150 @@ const extractTimeInfo = (question) => {
  * @returns {string} - Prompt cho Gemini
  */
 const createPrompt = (question, weatherData) => {
-  let prompt = `Bạn là một trợ lý thời tiết. Hãy trả lời câu hỏi của người dùng một cách ngắn gọn và đúng trọng tâm, dựa trên dữ liệu thời tiết sau:\n\n`;
+  console.log("weatherData", weatherData);
 
-  if (weatherData) {
-    // Thông tin địa điểm
-    prompt += `Địa điểm: ${weatherData.location.name}\n\n`;
+  // Kiểm tra xem có dữ liệu thời tiết không
+  const hasWeatherData =
+    weatherData &&
+    (weatherData.current?.current ||
+      weatherData.forecast?.forecast?.forecastday ||
+      weatherData.history?.forecast?.forecastday ||
+      weatherData.history?.forecastday ||
+      weatherData.future);
 
-    // Thông tin thời tiết hiện tại
-    if (weatherData.current) {
-      prompt += `Thời tiết hiện tại:\n`;
-      prompt += `- Nhiệt độ: ${weatherData.current.temp_c}°C\n`;
-      prompt += `- Trạng thái: ${weatherData.current.condition.text}\n`;
-      prompt += `- Gió: ${weatherData.current.wind_kph} km/h\n`;
-      if (weatherData.current.air_quality) {
-        prompt += `- Chất lượng không khí: ${weatherData.current.air_quality["us-epa-index"]}/6\n`;
-      }
-      prompt += "\n";
+  if (!hasWeatherData) {
+    return `Bạn là một trợ lý thời tiết. Hãy trả lời câu hỏi của người dùng một cách ngắn gọn và tự nhiên.
+
+Câu hỏi của người dùng: ${question}
+
+Vì hiện tại không có dữ liệu thời tiết, bạn cần thực hiện các bước sau để trả lời câu hỏi:
+
+1. Truy cập và đọc thông tin từ các nguồn dự báo thời tiết uy tín:
+   - Trung tâm Khí tượng Thủy văn Quốc gia (nchmf.gov.vn)
+   - AccuWeather (accuweather.com)
+   - Weather Underground (wunderground.com)
+   - The Weather Channel (weather.com)
+   - OpenWeatherMap (openweathermap.org)
+
+2. Sau khi đọc thông tin từ các nguồn trên:
+   - Tổng hợp thông tin từ các nguồn
+   - So sánh và phân tích sự khác biệt nếu có
+   - Đưa ra câu trả lời chính xác nhất
+
+3. Trả lời theo format sau:
+   - Thông tin chính: nhiệt độ và trạng thái thời tiết
+   - Chi tiết bổ sung: gió, mưa, độ ẩm nếu cần
+   - Lời khuyên: nếu có
+
+Lưu ý: 
+- KHÔNG sử dụng các ký tự đặc biệt như **, [], () trong câu trả lời
+- KHÔNG trả lời "không có dữ liệu" hoặc "đang tìm kiếm thông tin"
+- Trả lời một cách tự nhiên như đang nói chuyện với người dùng`;
+  }
+
+  let prompt = `Bạn là một trợ lý thời tiết. Hãy trả lời câu hỏi của người dùng một cách ngắn gọn và tự nhiên, dựa trên dữ liệu thời tiết sau:\n\n`;
+
+  // Thông tin địa điểm
+  if (weatherData.location) {
+    prompt += `Địa điểm: ${
+      weatherData.location.name || weatherData.location
+    }\n\n`;
+  }
+
+  // Thông tin thời tiết hiện tại
+  if (weatherData.current?.current) {
+    const current = weatherData.current.current;
+    prompt += `Thời tiết hiện tại (${current.last_updated}):\n`;
+    prompt += `- Nhiệt độ: ${current.temp_c || "N/A"}°C (cảm giác như ${
+      current.feelslike_c || "N/A"
+    }°C)\n`;
+    prompt += `- Trạng thái: ${current.condition?.text || "N/A"}\n`;
+    prompt += `- Gió: ${current.wind_kph || "N/A"} km/h (${
+      current.wind_dir || "N/A"
+    })\n`;
+    prompt += `- Độ ẩm: ${current.humidity || "N/A"}%\n`;
+    prompt += `- Lượng mưa: ${current.precip_mm || "N/A"} mm\n`;
+    prompt += `- Tầm nhìn: ${current.vis_km || "N/A"} km\n`;
+    if (current.air_quality) {
+      prompt += `- Chất lượng không khí: ${
+        current.air_quality["us-epa-index"] || "N/A"
+      }/6\n`;
     }
+    prompt += "\n";
+  }
 
-    // Thông tin dự báo
-    if (weatherData.forecast && weatherData.analysis) {
-      const { time } = weatherData.analysis;
+  // Thông tin dự báo
+  if (weatherData.forecast?.forecast?.forecastday) {
+    const forecastDays = weatherData.forecast.forecast.forecastday;
+    prompt += `Dự báo thời tiết:\n`;
 
-      if (time.type === "hourly") {
-        const targetDay = weatherData.forecast.forecastday.find(
-          (day) => day.date === weatherData.targetDate
-        );
-        if (targetDay && targetDay.hour) {
-          const hourData = targetDay.hour[time.value];
-          if (hourData) {
-            prompt += `Thời tiết ${time.value}${
-              time.period === "morning"
-                ? " giờ sáng"
-                : time.period === "afternoon"
-                ? " giờ chiều"
-                : time.period === "evening"
-                ? " giờ tối"
-                : time.period === "night"
-                ? " giờ đêm"
-                : " giờ"
-            }:\n`;
-            prompt += `- Nhiệt độ: ${hourData.temp_c}°C\n`;
-            prompt += `- Trạng thái: ${hourData.condition.text}\n`;
-            prompt += `- Gió: ${hourData.wind_kph} km/h\n`;
-            prompt += `- Mưa: ${hourData.chance_of_rain}%\n`;
-            prompt += "\n";
-          }
-        }
-      } else if (time.type === "specific") {
-        const targetDay = weatherData.forecast.forecastday.find(
-          (day) => day.date === weatherData.targetDate
-        );
-        if (targetDay) {
-          prompt += `Thời tiết ${
-            time.value === "today"
-              ? "hôm nay"
-              : time.value === "tomorrow"
-              ? "ngày mai"
-              : time.value === "yesterday"
-              ? "hôm qua"
-              : "ngày kia"
-          }:\n`;
-          prompt += `- Nhiệt độ: ${targetDay.day.avgtemp_c}°C\n`;
-          prompt += `- Trạng thái: ${targetDay.day.condition.text}\n`;
-          prompt += `- Mưa: ${targetDay.day.daily_chance_of_rain}%\n`;
-          prompt += "\n";
-        }
-      } else if (time.type === "range") {
-        prompt += `Dự báo ${time.value} ngày ${
-          time.rangeType === "future" ? "tới" : "qua"
-        }:\n`;
-        weatherData.forecast.forecastday.forEach((day) => {
-          prompt += `${day.date}:\n`;
-          prompt += `- Nhiệt độ: ${day.day.avgtemp_c}°C\n`;
-          prompt += `- Trạng thái: ${day.day.condition.text}\n`;
-          prompt += `- Mưa: ${day.day.daily_chance_of_rain}%\n`;
-        });
-        prompt += "\n";
-      }
-    }
+    forecastDays.forEach((day) => {
+      prompt += `Ngày ${day.date}:\n`;
+      prompt += `- Nhiệt độ: ${day.day.avgtemp_c || "N/A"}°C (cao nhất: ${
+        day.day.maxtemp_c || "N/A"
+      }°C, thấp nhất: ${day.day.mintemp_c || "N/A"}°C)\n`;
+      prompt += `- Trạng thái: ${day.day.condition?.text || "N/A"}\n`;
+      prompt += `- Lượng mưa: ${day.day.totalprecip_mm || "N/A"} mm\n`;
+      prompt += `- Độ ẩm: ${day.day.avghumidity || "N/A"}%\n`;
+      prompt += `- Gió: ${day.day.maxwind_kph || "N/A"} km/h\n\n`;
+    });
+  }
 
-    // Thông tin thời tiết tương lai (14-300 ngày)
-    if (weatherData.future) {
-      prompt += `Dự báo thời tiết tương lai (${weatherData.targetDate}):\n`;
-      prompt += `- Nhiệt độ: ${weatherData.future.forecast.forecastday[0].day.avgtemp_c}°C\n`;
-      prompt += `- Trạng thái: ${weatherData.future.forecast.forecastday[0].day.condition.text}\n`;
-      prompt += `- Mưa: ${weatherData.future.forecast.forecastday[0].day.daily_chance_of_rain}%\n`;
-      prompt += "\n";
-    }
-
-    // Thông tin thời tiết biển
-    if (weatherData.marine) {
-      prompt += `Thông tin thời tiết biển:\n`;
-      if (weatherData.marine.forecast.forecastday[0].hour) {
-        const marineData = weatherData.marine.forecast.forecastday[0].hour[0];
-        prompt += `- Nhiệt độ nước: ${marineData.water_temp_c}°C\n`;
-        prompt += `- Sóng: ${marineData.wave_height_m}m\n`;
-        prompt += `- Hướng sóng: ${marineData.wave_direction}\n`;
-        if (marineData.tide) {
-          prompt += `- Thủy triều: ${marineData.tide.tide_type}\n`;
-        }
-      }
-      prompt += "\n";
-    }
-
-    // Thông tin thiên văn
-    if (weatherData.astronomy) {
-      prompt += `Thông tin thiên văn:\n`;
-      prompt += `- Mặt trời mọc: ${weatherData.astronomy.astro.sunrise}\n`;
-      prompt += `- Mặt trời lặn: ${weatherData.astronomy.astro.sunset}\n`;
-      prompt += `- Mặt trăng mọc: ${weatherData.astronomy.astro.moonrise}\n`;
-      prompt += `- Mặt trăng lặn: ${weatherData.astronomy.astro.moonset}\n`;
-      prompt += `- Pha mặt trăng: ${weatherData.astronomy.astro.moon_phase}\n`;
-      prompt += `- Độ sáng mặt trăng: ${weatherData.astronomy.astro.moon_illumination}%\n`;
-      prompt += "\n";
-    }
-
-    // Thông tin múi giờ
-    if (weatherData.timezone) {
-      prompt += `Thông tin múi giờ:\n`;
-      prompt += `- Múi giờ: ${weatherData.timezone.location.tz_id}\n`;
-      prompt += `- Giờ địa phương: ${weatherData.timezone.location.localtime}\n`;
-      prompt += "\n";
-    }
-
-    // Thông tin cảnh báo thời tiết
-    if (weatherData.alerts && weatherData.alerts.alert) {
-      prompt += `Cảnh báo thời tiết:\n`;
-      weatherData.alerts.alert.forEach((alert) => {
-        prompt += `- ${alert.headline}\n`;
-        prompt += `  ${alert.msg}\n`;
-      });
-      prompt += "\n";
-    }
-
-    // Thông tin sự kiện thể thao
-    if (weatherData.sports && weatherData.sports.football) {
-      prompt += `Sự kiện thể thao:\n`;
-      weatherData.sports.football.forEach((event) => {
-        prompt += `- ${event.tournament}: ${event.match}\n`;
-        prompt += `  Thời gian: ${event.start}\n`;
-        prompt += `  Địa điểm: ${event.stadium}, ${event.country}\n`;
-      });
-      prompt += "\n";
+  // Thông tin lịch sử thời tiết
+  if (weatherData.history) {
+    const historyData =
+      weatherData.history.forecast?.forecastday ||
+      weatherData.history.forecastday;
+    if (historyData && historyData.length > 0) {
+      const historyDay = historyData[0];
+      prompt += `Thời tiết ngày ${historyDay.date}:\n`;
+      prompt += `- Nhiệt độ trung bình: ${
+        historyDay.day?.avgtemp_c || historyDay.avgtemp_c || "N/A"
+      }°C\n`;
+      prompt += `- Nhiệt độ cao nhất: ${
+        historyDay.day?.maxtemp_c || historyDay.maxtemp_c || "N/A"
+      }°C\n`;
+      prompt += `- Nhiệt độ thấp nhất: ${
+        historyDay.day?.mintemp_c || historyDay.mintemp_c || "N/A"
+      }°C\n`;
+      prompt += `- Trạng thái: ${
+        historyDay.day?.condition?.text || historyDay.condition?.text || "N/A"
+      }\n`;
+      prompt += `- Lượng mưa: ${
+        historyDay.day?.totalprecip_mm || historyDay.totalprecip_mm || "N/A"
+      } mm\n`;
+      prompt += `- Độ ẩm: ${
+        historyDay.day?.avghumidity || historyDay.avghumidity || "N/A"
+      }%\n`;
+      prompt += `- Gió: ${
+        historyDay.day?.maxwind_kph || historyDay.maxwind_kph || "N/A"
+      } km/h\n\n`;
     }
   }
 
+  // Thông tin thiên văn
+  if (weatherData.astronomy?.astronomy?.astro) {
+    const astro = weatherData.astronomy.astronomy.astro;
+    prompt += `Thông tin thiên văn:\n`;
+    prompt += `- Mặt trời mọc: ${astro.sunrise || "N/A"}\n`;
+    prompt += `- Mặt trời lặn: ${astro.sunset || "N/A"}\n`;
+    prompt += `- Mặt trăng mọc: ${astro.moonrise || "N/A"}\n`;
+    prompt += `- Mặt trăng lặn: ${astro.moonset || "N/A"}\n`;
+    prompt += `- Pha mặt trăng: ${astro.moon_phase || "N/A"}\n\n`;
+  }
+
+  // Thông tin cảnh báo
+  if (weatherData.alerts?.alerts?.alert?.length > 0) {
+    prompt += `Cảnh báo thời tiết:\n`;
+    weatherData.alerts.alerts.alert.forEach((alert) => {
+      prompt += `- ${alert.headline || "N/A"}\n`;
+      prompt += `  ${alert.msgtype || "N/A"}: ${alert.severity || "N/A"}\n`;
+      prompt += `  ${alert.desc || "N/A"}\n\n`;
+    });
+  }
+
   prompt += `Câu hỏi của người dùng: ${question}\n\n`;
-  prompt += `Hãy trả lời ngắn gọn, tập trung vào thông tin quan trọng nhất. Nếu có thể, hãy thêm một lời khuyên ngắn gọn liên quan đến thời tiết.`;
+  prompt += `Hãy trả lời ngắn gọn và tự nhiên, không sử dụng các ký tự đặc biệt như **, [], (). Chỉ tập trung vào thông tin cần thiết để trả lời câu hỏi.`;
 
   return prompt;
 };
@@ -751,25 +824,27 @@ const getSportsEvents = async (location) => {
  * Xử lý câu hỏi về thời tiết
  * @param {string} question - Câu hỏi của người dùng
  * @param {string} city - Tên thành phố (nếu có)
+ * @param {string} sessionId - ID phiên chat
  * @returns {Promise<Object>} - Câu trả lời và dữ liệu thời tiết
  */
-const processWeatherQuestion = async (question, city) => {
+const processWeatherQuestion = async (question, city, sessionId) => {
   console.log("Processing question:", question, "for city:", city);
 
   try {
-    // Phân tích câu hỏi bằng Gemini
+    // Phân tích câu hỏi
     const analysis = await analyzeQuestion(question);
     console.log("Question analysis:", analysis);
 
-    // Xác định địa điểm
+    // Xác định địa điểm - ưu tiên location từ analysis trước
     let location = null;
-    if (!city && analysis.location) {
+    if (analysis.location) {
       const results = await searchLocation(analysis.location);
       if (results.length > 0) {
         location = results[0];
         city = location.name;
       }
     } else if (city) {
+      // Nếu không có location trong analysis thì mới dùng city
       const results = await searchLocation(city);
       if (results.length > 0) {
         location = results[0];
@@ -785,34 +860,63 @@ const processWeatherQuestion = async (question, city) => {
       };
     }
 
-    // Tính toán thời gian
-    const today = new Date();
-    let targetDate = new Date(today);
+    // Lấy dữ liệu thời tiết
+    let weatherData = {
+      location: location || { name: city },
+      current: null,
+      forecast: null,
+      history: null,
+      astronomy: null,
+      future: null,
+      marine: null,
+      timezone: null,
+      alerts: null,
+      analysis,
+      targetDate: analysis.time.value || new Date().toISOString().split("T")[0],
+    };
 
-    if (analysis.time.type === "specific") {
-      if (analysis.time.value === "tomorrow") {
-        targetDate.setDate(today.getDate() + 1);
-      } else if (analysis.time.value === "yesterday") {
-        targetDate.setDate(today.getDate() - 1);
-      } else if (analysis.time.value === "today") {
-        // Giữ nguyên ngày hiện tại
-      } else {
-        const dateMatch = analysis.time.value.match(/(\d+)/);
-        if (dateMatch) {
-          const days = parseInt(dateMatch[1]);
-          targetDate.setDate(today.getDate() + days);
+    // Xử lý lịch sử thời tiết
+    if (analysis.time.isHistory) {
+      try {
+        // Chuyển đổi ngày tương đối thành ngày thực tế
+        let targetDate = analysis.time.value;
+        if (targetDate === "hôm qua") {
+          const yesterday = new Date();
+          yesterday.setDate(yesterday.getDate() - 1);
+          targetDate = yesterday.toISOString().split("T")[0];
+        } else if (targetDate === "hôm kia") {
+          const dayBeforeYesterday = new Date();
+          dayBeforeYesterday.setDate(dayBeforeYesterday.getDate() - 2);
+          targetDate = dayBeforeYesterday.toISOString().split("T")[0];
+        } else if (
+          typeof targetDate === "string" &&
+          targetDate.includes("ngày")
+        ) {
+          const days = parseInt(targetDate.match(/\d+/)[0]);
+          const pastDate = new Date();
+          pastDate.setDate(pastDate.getDate() - days);
+          targetDate = pastDate.toISOString().split("T")[0];
+        }
+
+        console.log("Fetching weather history for date:", targetDate);
+        const response = await axios.get(API_ENDPOINTS.history, {
+          params: {
+            key: API_KEY,
+            q: location ? `${location.lat},${location.lon}` : city,
+            dt: targetDate,
+            lang: "vi",
+            aqi: "yes",
+          },
+        });
+        weatherData.history = response.data;
+        weatherData.targetDate = targetDate; // Cập nhật targetDate với ngày thực tế
+      } catch (error) {
+        console.error("Error fetching weather history:", error.message);
+        if (error.response) {
+          console.error("API Error Response:", error.response.data);
         }
       }
     }
-
-    // Lấy dữ liệu thời tiết với error handling riêng cho từng request
-    let currentData = null;
-    let forecastData = null;
-    let astronomyData = null;
-    let futureData = null;
-    let marineData = null;
-    let timezoneData = null;
-    let alertsData = null;
 
     // Lấy thông tin thời tiết hiện tại
     try {
@@ -824,7 +928,7 @@ const processWeatherQuestion = async (question, city) => {
           aqi: "yes",
         },
       });
-      currentData = response.data;
+      weatherData.current = response.data;
     } catch (error) {
       console.error("Error fetching current weather:", error.message);
     }
@@ -841,7 +945,7 @@ const processWeatherQuestion = async (question, city) => {
             analysis.time.type === "hourly" ? analysis.time.value : undefined,
         },
       });
-      forecastData = response.data;
+      weatherData.forecast = response.data;
     } catch (error) {
       console.error("Error fetching forecast:", error.message);
     }
@@ -852,28 +956,30 @@ const processWeatherQuestion = async (question, city) => {
         params: {
           key: API_KEY,
           q: location ? `${location.lat},${location.lon}` : city,
-          dt: targetDate.toISOString().split("T")[0],
+          dt: weatherData.targetDate,
           lang: "vi",
         },
       });
-      astronomyData = response.data;
+      weatherData.astronomy = response.data;
     } catch (error) {
       console.error("Error fetching astronomy data:", error.message);
     }
 
     // Lấy thông tin thời tiết tương lai nếu ngày yêu cầu > 14 ngày
-    const daysDiff = Math.ceil((targetDate - today) / (1000 * 60 * 60 * 24));
+    const daysDiff = Math.ceil(
+      (weatherData.targetDate - new Date()) / (1000 * 60 * 60 * 24)
+    );
     if (daysDiff > 14 && daysDiff <= 300) {
       try {
         const response = await axios.get(API_ENDPOINTS.future, {
           params: {
             key: API_KEY,
             q: location ? `${location.lat},${location.lon}` : city,
-            dt: targetDate.toISOString().split("T")[0],
+            dt: weatherData.targetDate,
             lang: "vi",
           },
         });
-        futureData = response.data;
+        weatherData.future = response.data;
       } catch (error) {
         console.error("Error fetching future weather:", error.message);
       }
@@ -889,7 +995,7 @@ const processWeatherQuestion = async (question, city) => {
           lang: "vi",
         },
       });
-      marineData = response.data;
+      weatherData.marine = response.data;
     } catch (error) {
       console.error("Error fetching marine weather:", error.message);
     }
@@ -902,7 +1008,7 @@ const processWeatherQuestion = async (question, city) => {
           q: location ? `${location.lat},${location.lon}` : city,
         },
       });
-      timezoneData = response.data;
+      weatherData.timezone = response.data;
     } catch (error) {
       console.error("Error fetching timezone:", error.message);
     }
@@ -916,13 +1022,13 @@ const processWeatherQuestion = async (question, city) => {
           lang: "vi",
         },
       });
-      alertsData = response.data;
+      weatherData.alerts = response.data;
     } catch (error) {
       console.error("Error fetching weather alerts:", error.message);
     }
 
     // Kiểm tra xem có đủ dữ liệu để trả lời không
-    if (!currentData && !forecastData && !futureData) {
+    if (!weatherData.current && !weatherData.forecast && !weatherData.future) {
       return {
         answer:
           "Xin lỗi, hiện tại không thể lấy được thông tin thời tiết. Vui lòng thử lại sau.",
@@ -930,74 +1036,105 @@ const processWeatherQuestion = async (question, city) => {
       };
     }
 
-    // Kết hợp dữ liệu thời tiết
-    const weatherData = {
-      location: location || { name: city },
-      current: currentData?.current || null,
-      forecast: forecastData?.forecast || null,
-      astronomy: astronomyData?.astronomy || null,
-      future: futureData || null,
-      marine: marineData || null,
-      timezone: timezoneData || null,
-      alerts: alertsData || null,
-      analysis: analysis,
-      targetDate: targetDate.toISOString().split("T")[0],
-    };
-
-    // Tạo prompt cho Gemini với fallback mechanism
+    // Tạo prompt cho Gemini với thông tin lịch sử
     let answer;
     try {
       const prompt = createPrompt(question, weatherData);
       console.log("Generated prompt for Gemini");
 
-      const result = await model.generateContent(prompt);
-      answer = result.response.text();
+      answer = await generateWithRetry(prompt);
       console.log("Received answer from Gemini");
     } catch (error) {
       console.error("Error generating answer with Gemini:", error);
-      answer = generateFallbackAnswer(question, weatherData);
+      // Provide a more helpful error message
+      if (error.message.includes("GoogleGenerativeAI Error")) {
+        answer =
+          "Xin lỗi, hiện tại có vấn đề với kết nối đến dịch vụ dự báo thời tiết. Vui lòng thử lại sau vài phút.";
+      } else {
+        answer = generateFallbackAnswer(question, weatherData);
+      }
     }
 
-    return { answer, weatherData };
+    // Chuẩn bị dữ liệu analysis
+    const analysisData = weatherData?.analysis
+      ? {
+          location: weatherData.analysis.location || null,
+          time: {
+            type: weatherData.analysis.time?.type || "current",
+            value: weatherData.analysis.time?.value || null,
+            period: weatherData.analysis.time?.period || null,
+            isHistory: weatherData.analysis.time?.isHistory || false,
+          },
+          type:
+            weatherData.analysis.type === "daily"
+              ? "current"
+              : weatherData.analysis.type || "current",
+          details: weatherData.analysis.details || [],
+        }
+      : null;
+
+    // Lưu vào database
+    const chat = await Chat.create({
+      question,
+      answer,
+      weatherData,
+      sessionId: sessionId || Date.now().toString(),
+      location: weatherData?.location?.name || city || null,
+      date: weatherData?.targetDate || null,
+      type:
+        weatherData?.analysis?.type === "daily"
+          ? "current"
+          : weatherData?.analysis?.type || "current",
+      analysis: analysisData,
+    });
+
+    return { answer, weatherData, chat };
   } catch (error) {
-    console.error("Error processing weather question:", error);
-    return {
-      answer:
-        "Xin lỗi, có lỗi xảy ra khi xử lý câu hỏi của bạn. Vui lòng thử lại sau.",
-      weatherData: null,
-    };
+    console.error("Chat Error:", error);
+    throw error;
   }
 };
 
 // Hàm tạo câu trả lời đơn giản khi Gemini không hoạt động
 const generateFallbackAnswer = (question, weatherData) => {
-  if (!weatherData) return "Xin lỗi, không thể lấy được thông tin thời tiết.";
+  if (!weatherData) {
+    return "Xin lỗi, không thể lấy được thông tin thời tiết vào lúc này. Vui lòng thử lại sau.";
+  }
 
   const { current, forecast, analysis } = weatherData;
   let answer = "";
 
   if (current) {
-    answer += `Thời tiết hiện tại tại ${weatherData.location.name}: ${current.temp_c}°C, ${current.condition.text}. `;
+    answer += `Thời tiết hiện tại tại ${
+      weatherData.location?.name || "địa điểm này"
+    }: `;
+    answer += `${current.temp_c || "N/A"}°C, ${
+      current.condition?.text || "N/A"
+    }. `;
   }
 
-  if (forecast && forecast.forecastday && forecast.forecastday.length > 0) {
+  if (forecast?.forecastday?.[0]) {
     const today = forecast.forecastday[0];
-    answer += `Dự báo ngày mai: ${today.day.avgtemp_c}°C, ${today.day.condition.text}. `;
+    answer += `Dự báo ngày mai: ${today.day.avgtemp_c || "N/A"}°C, ${
+      today.day.condition?.text || "N/A"
+    }. `;
   }
 
-  if (analysis.time.type === "hourly" && forecast) {
+  if (analysis?.time?.type === "hourly" && forecast?.forecastday) {
     const targetDay = forecast.forecastday.find(
       (day) => day.date === weatherData.targetDate
     );
-    if (targetDay && targetDay.hour) {
+    if (targetDay?.hour) {
       const hourData = targetDay.hour[analysis.time.value];
       if (hourData) {
-        answer += `Thời tiết lúc ${analysis.time.value} giờ: ${hourData.temp_c}°C, ${hourData.condition.text}. `;
+        answer += `Thời tiết lúc ${analysis.time.value} giờ: ${
+          hourData.temp_c || "N/A"
+        }°C, ${hourData.condition?.text || "N/A"}. `;
       }
     }
   }
 
-  return answer || "Xin lỗi, không thể tạo câu trả lời phù hợp.";
+  return answer || "Xin lỗi, không thể tạo câu trả lời phù hợp vào lúc này.";
 };
 
 /**
@@ -1017,18 +1154,11 @@ const handleChat = async (req, res) => {
 
   try {
     // Xử lý câu hỏi
-    const { answer, weatherData } = await processWeatherQuestion(
+    const { answer, weatherData, chat } = await processWeatherQuestion(
       question,
-      city
+      city || null,
+      sessionId
     );
-
-    // Lưu vào database
-    const chat = await Chat.create({
-      question,
-      answer,
-      weatherData,
-      sessionId: sessionId || Date.now().toString(),
-    });
 
     return res.json({
       message: "Chat processed successfully",

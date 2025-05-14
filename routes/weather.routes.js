@@ -9,6 +9,7 @@ const {
   getTimeZone,
   getWeatherAlerts,
   getSevenDayForecast,
+  getWeatherHistory,
 } = require("../controllers/weather.controller");
 const {
   handleChat,
@@ -26,7 +27,12 @@ const errorHandler = (err, req, res, next) => {
 
 // Input validation middleware
 const validateQuery = (req, res, next) => {
-  const { location, lat, lon } = req.query;
+  const { location, lat, lon, q, dt, date } = req.query;
+
+  // Chuyển đổi tham số q thành location nếu có
+  const finalLocation = q || location;
+  // Chuyển đổi tham số dt thành date nếu có
+  const finalDate = dt || date;
 
   // Kiểm tra nếu có lat thì phải có lon và ngược lại
   if ((lat && !lon) || (!lat && lon)) {
@@ -37,7 +43,7 @@ const validateQuery = (req, res, next) => {
   }
 
   // Nếu không có location name thì phải có lat,lon
-  if (!location && (!lat || !lon)) {
+  if (!finalLocation && (!lat || !lon)) {
     return res.status(400).json({
       error: "Location is required",
       message: "Vui lòng cung cấp địa điểm (tên) hoặc tọa độ (lat,lon).",
@@ -71,7 +77,67 @@ const validateQuery = (req, res, next) => {
     }
   }
 
+  // Giữ nguyên tất cả các tham số gốc và thêm các tham số mới nếu cần
+  if (q && !location) req.query.location = q;
+  if (dt && !date) req.query.date = dt;
+
   next();
+};
+
+// Middleware cho route history
+const validateHistoryQuery = (req, res, next) => {
+  try {
+    const { q, dt, location } = req.query;
+
+    // Kiểm tra các tham số bắt buộc
+    if (!q && !location) {
+      return res.status(400).json({
+        error: "Missing required parameter",
+        message: "Location parameter (q or location) is required",
+      });
+    }
+
+    if (!dt) {
+      return res.status(400).json({
+        error: "Missing required parameter",
+        message: "Date parameter (dt) is required",
+      });
+    }
+
+    // Validate định dạng ngày
+    const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+    if (!dateRegex.test(dt)) {
+      return res.status(400).json({
+        error: "Invalid date format",
+        message: "Date must be in YYYY-MM-DD format",
+      });
+    }
+
+    // Validate phạm vi ngày
+    const requestDate = new Date(dt);
+    const minDate = new Date("2010-01-01");
+
+    if (requestDate < minDate) {
+      return res.status(400).json({
+        error: "Invalid date",
+        message: "Date must be from January 1, 2010 onwards",
+      });
+    }
+
+    // Chuyển đổi tham số để phù hợp với controller
+    req.query = {
+      ...req.query, // giữ nguyên các tham số gốc (q, dt, lang, aqi)
+      location: q || location, // sử dụng q nếu có, nếu không thì dùng location
+      date: dt, // thêm date từ dt
+    };
+
+    next();
+  } catch (error) {
+    return res.status(500).json({
+      error: "Validation error",
+      message: error.message,
+    });
+  }
 };
 
 // Weather routes
@@ -83,6 +149,9 @@ router.get("/weather/marine", validateQuery, getMarineWeather);
 router.get("/weather/astronomy", validateQuery, getAstronomy);
 router.get("/weather/timezone", validateQuery, getTimeZone);
 router.get("/weather/alerts", validateQuery, getWeatherAlerts);
+
+// History route with its own middleware
+router.get("/weather/history", validateHistoryQuery, getWeatherHistory);
 
 // Chat routes
 router.post("/chat", handleChat);
