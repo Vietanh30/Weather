@@ -10,6 +10,10 @@ const {
   getWeatherAlerts,
   getSevenDayForecast,
   getWeatherHistory,
+  getWeatherNotifications,
+  subscribeToAlerts,
+  unsubscribeFromAlerts,
+  getWeatherNotificationDetail,
 } = require("../controllers/weather.controller");
 const {
   handleChat,
@@ -149,6 +153,24 @@ router.get("/weather/marine", validateQuery, getMarineWeather);
 router.get("/weather/astronomy", validateQuery, getAstronomy);
 router.get("/weather/timezone", validateQuery, getTimeZone);
 router.get("/weather/alerts", validateQuery, getWeatherAlerts);
+
+// New notification routes
+router.get("/weather/notifications", validateQuery, getWeatherNotifications);
+router.get(
+  "/weather/notifications/detail",
+  validateQuery,
+  getWeatherNotificationDetail
+);
+router.post(
+  "/weather/notifications/subscribe",
+  validateQuery,
+  subscribeToAlerts
+);
+router.post(
+  "/weather/notifications/unsubscribe",
+  validateQuery,
+  unsubscribeFromAlerts
+);
 
 // History route with its own middleware
 router.get("/weather/history", validateHistoryQuery, getWeatherHistory);
